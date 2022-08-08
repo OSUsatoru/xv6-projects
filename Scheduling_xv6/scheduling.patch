@@ -1,0 +1,599 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..209701e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -32,7 +32,7 @@ OBJS = \
+ # TOOLPREFIX = i386-jos-elf
+ 
+ # Using native tools (e.g., on X86 Linux)
+-#TOOLPREFIX = 
++#TOOLPREFIX =
+ 
+ # Try to infer the correct TOOLPREFIX if not set
+ ifndef TOOLPREFIX
+@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
+ endif
+ 
+ # If the makefile can't find QEMU, specify its path here
+-# QEMU = qemu-system-i386
++QEMU = /usr/libexec/qemu-kvm
+ 
+ # Try to infer the correct QEMU
+ ifndef QEMU
+@@ -76,7 +76,7 @@ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O0 -g3 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -181,13 +181,15 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_testcall\
++	_testcall2\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+ 
+ -include *.d
+ 
+-clean: 
++clean:
+ 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+ 	*.o *.d *.asm *.sym vectors.S bootblock entryother \
+ 	initcode initcode.out kernel xv6.img fs.img kernelmemfs \
+@@ -217,7 +219,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 2
++CPUS := 1
+ endif
+ QEMUOPTS = -drive file=fs.img,index=1,media=disk,format=raw -drive file=xv6.img,index=0,media=disk,format=raw -smp $(CPUS) -m 512 $(QEMUEXTRA)
+ 
+diff --git a/defs.h b/defs.h
+index 82fb982..05cec32 100644
+--- a/defs.h
++++ b/defs.h
+@@ -10,6 +10,8 @@ struct sleeplock;
+ struct stat;
+ struct superblock;
+ 
++struct pstat;
++
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -120,7 +122,9 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
+-
++// add def
++int             settickets(int tickets);
++int             getpinfo(struct pstat* pinfo);
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+@@ -162,6 +166,8 @@ void            timerinit(void);
+ // trap.c
+ void            idtinit(void);
+ extern uint     ticks;
++extern uint     is_boost;   // is ready to boost
++
+ void            tvinit(void);
+ extern struct spinlock tickslock;
+ 
+diff --git a/main.c b/main.c
+index 9924e64..dd20e82 100644
+--- a/main.c
++++ b/main.c
+@@ -17,6 +17,8 @@ extern char end[]; // first address after kernel loaded from ELF file
+ int
+ main(void)
+ {
++  // initialize syscallCount
++  syscallCount = 0;
+   kinit1(end, P2V(4*1024*1024)); // phys page allocator
+   kvmalloc();      // kernel page table
+   mpinit();        // detect other processors
+@@ -30,7 +32,7 @@ main(void)
+   tvinit();        // trap vectors
+   binit();         // buffer cache
+   fileinit();      // file table
+-  ideinit();       // disk 
++  ideinit();       // disk
+   startothers();   // start other processors
+   kinit2(P2V(4*1024*1024), P2V(PHYSTOP)); // must come after startothers()
+   userinit();      // first user process
+diff --git a/proc.c b/proc.c
+index 806b1b1..9dbaa85 100644
+--- a/proc.c
++++ b/proc.c
+@@ -6,6 +6,14 @@
+ #include "x86.h"
+ #include "proc.h"
+ #include "spinlock.h"
++#include "pstat.h"
++
++#include "random.h"
++
++// https://www.cs.virginia.edu/~cr4bd/4414/F2019/files/lcg_parkmiller_c.txt
++// random number generator
++
++
+ 
+ struct {
+   struct spinlock lock;
+@@ -14,6 +22,11 @@ struct {
+ 
+ static struct proc *initproc;
+ 
++//struct pstat *mypstat;
++
++
++int syscallCount;               //initialize variable
++
+ int nextpid = 1;
+ extern void forkret(void);
+ extern void trapret(void);
+@@ -38,10 +51,10 @@ struct cpu*
+ mycpu(void)
+ {
+   int apicid, i;
+-  
++
+   if(readeflags()&FL_IF)
+     panic("mycpu called with interrupts enabled\n");
+-  
++
+   apicid = lapicid();
+   // APIC IDs are not guaranteed to be contiguous. Maybe we should have
+   // a reverse map, or reserve a register to store &cpus[i].
+@@ -75,12 +88,22 @@ allocproc(void)
+ {
+   struct proc *p;
+   char *sp;
++  //int index = 0;
++  // initialize syscallCount
++  //p->syscallCount = 0;
++
+ 
+   acquire(&ptable.lock);
+ 
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->state == UNUSED)
+-      goto found;
++          goto found;
++    //index++;
++  }
++
++
++
++
+ 
+   release(&ptable.lock);
+   return 0;
+@@ -88,6 +111,12 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->tickets = 1;
++  //  first places jobs into the high-priority queue
++  p->pri_queue = 1;
++  p->high_ticks = 0;
++  p->low_ticks = 0;
++
+ 
+   release(&ptable.lock);
+ 
+@@ -124,7 +153,7 @@ userinit(void)
+   extern char _binary_initcode_start[], _binary_initcode_size[];
+ 
+   p = allocproc();
+-  
++
+   initproc = p;
+   if((p->pgdir = setupkvm()) == 0)
+     panic("userinit: out of memory?");
+@@ -139,6 +168,8 @@ userinit(void)
+   p->tf->esp = PGSIZE;
+   p->tf->eip = 0;  // beginning of initcode.S
+ 
++  //p->tickets = 1; //initial ticket is 1
++
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+ 
+@@ -208,10 +239,15 @@ fork(void)
+       np->ofile[i] = filedup(curproc->ofile[i]);
+   np->cwd = idup(curproc->cwd);
+ 
++  //np->tickets = 1; // initialize tickets for child
++
++
+   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+ 
+   pid = np->pid;
+ 
++
++
+   acquire(&ptable.lock);
+ 
+   np->state = RUNNABLE;
+@@ -275,7 +311,7 @@ wait(void)
+   struct proc *p;
+   int havekids, pid;
+   struct proc *curproc = myproc();
+-  
++
+   acquire(&ptable.lock);
+   for(;;){
+     // Scan through table looking for exited children.
+@@ -319,33 +355,104 @@ wait(void)
+ //  - swtch to start running that process
+ //  - eventually that process transfers control
+ //      via swtch back to the scheduler.
++
+ void
+ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
+   c->proc = 0;
+-  
++
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
+ 
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++
++    int sum_high_tickets = 0, sum_low_tickets = 0;
++
++    int running_priority = 0;
++    // get total tickets
++
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
+ 
++      if(p->pri_queue == 1){
++        sum_high_tickets += p->tickets;
++        running_priority = 1;
++      }else if(p->pri_queue == 0){
++        sum_low_tickets += p->tickets;
++      }
++    }
++
++
++    //cprintf("test sum: %d\n", sum);
++
++
++    /*
++    if(sum_high_tickets!=0){
++      running_priority = 1;
++      winner = next_random()%sum_high_tickets;
++    }else{
++      running_priority = 0;
++      winner = next_random()%sum_low_tickets;
++    }*/
++    // if priority = 1, 1*high - 0*low
++    // if priority = 0, 0*high - 1 * low
++    //int winner = next_random()% ((running_priority*(sum_high_tickets) + (1-running_priority)*sum_low_tickets));
++    int winner = random_at_most(running_priority*(sum_high_tickets) + (1-running_priority)*sum_low_tickets);
++
++    if(0){
++      cprintf("test: running priority: %d\n", running_priority);
++      //cprintf("test: sum_high_tickets: %d\n", sum_high_tickets);
++      //cprintf("test: sum_low_tickets: %d\n", sum_low_tickets);
++      cprintf("test: winner: %d\n", winner);
++    }
++
++
++    int counter = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->state != RUNNABLE || p->pri_queue != running_priority)
++        continue;
++
++      counter+=p->tickets;
++      //if(counter>winner)
++      //  break;
++      if(counter < winner)
++        continue;
++
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+       c->proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
+-
++      //cprintf("RUNNING: %s [pid %d]\n", proc->name, proc->pid);
+       swtch(&(c->scheduler), p->context);
+       switchkvm();
+ 
++
++      // if priority is 1, if priority is 0
++      if(running_priority == 1){
++        p->high_ticks++;
++        p->pri_queue = 0;
++      }else if(running_priority == 0){
++        p->low_ticks++;
++      }
++
++      // priority boost
++      if(is_boost){
++        cprintf("priority boost: [%d]\n", ticks);
++        // boost priority to 1
++        struct proc *temp_proc;
++        for(temp_proc = ptable.proc; temp_proc < &ptable.proc[NPROC]; temp_proc++){
++          temp_proc->pri_queue = 1;
++        }
++        //reset
++        is_boost = 0;
++      }
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       c->proc = 0;
+@@ -418,7 +525,7 @@ void
+ sleep(void *chan, struct spinlock *lk)
+ {
+   struct proc *p = myproc();
+-  
++
+   if(p == 0)
+     panic("sleep");
+ 
+@@ -532,3 +639,50 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++int settickets(int tickets)
++{
++  if(tickets <0){
++    return -1;
++  }
++
++  struct proc* current_process = myproc();
++  current_process->tickets = tickets;
++
++  return 0;
++}
++
++int getpinfo(struct pstat *pinfo)
++{
++  struct proc * myproc;
++  //cprintf("test\n");
++
++  // Loop over process table looking for process to run.
++  acquire(&ptable.lock);
++  //cprintf("test\n");
++  int index = 0;
++  for (myproc = ptable.proc; myproc < &ptable.proc[NPROC]; myproc++){
++    //cprintf("index: %d\n", index);
++    if(myproc->pid == 0 && myproc->state == UNUSED){
++      pinfo->inuse[index] = 0;
++    }else{
++      pinfo->inuse[index] = 1;
++    }
++    pinfo->pid[index] = myproc->pid;
++    pinfo->hticks[index] = myproc->high_ticks;
++    pinfo->lticks[index] = myproc->low_ticks;
++
++    if(pinfo->inuse[index] == 2){
++      cprintf("---\n");
++      cprintf("parent pid:%d\n",myproc->parent->pid);
++      cprintf("name: %s\n",myproc->name);
++      cprintf("pid: %d, queue: %d, tickets: %d\n", myproc->pid, myproc->pri_queue, myproc->tickets);
++      cprintf("pid: %d, hticks: %d, lticks: %d\n", pinfo->pid[index], pinfo->hticks[index],pinfo->lticks[index]);
++      cprintf("---\n");
++    }
++    index++;
++  }
++  release(&ptable.lock);
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/proc.h b/proc.h
+index 1647114..24e0386 100644
+--- a/proc.h
++++ b/proc.h
+@@ -1,3 +1,4 @@
++#include "pstat.h"
+ // Per-CPU state
+ struct cpu {
+   uchar apicid;                // Local APIC ID
+@@ -12,6 +13,7 @@ struct cpu {
+ 
+ extern struct cpu cpus[NCPU];
+ extern int ncpu;
++extern int syscallCount;            // counter for systemcall
+ 
+ //PAGEBREAK: 17
+ // Saved registers for kernel context switches.
+@@ -49,8 +51,14 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  int tickets;                 // assigned tickets
++  int pri_queue;               // queue num (0 - 1)
++  int high_ticks;              // ticks for high queue (1)
++  int low_ticks;               // ticks for low queue (0)
+ };
+ 
++
+ // Process memory is laid out contiguously, low addresses first:
+ //   text
+ //   original data and bss
+diff --git a/syscall.c b/syscall.c
+index ee85261..99d4b3a 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -60,7 +60,7 @@ argptr(int n, char **pp, int size)
+ {
+   int i;
+   struct proc *curproc = myproc();
+- 
++
+   if(argint(n, &i) < 0)
+     return -1;
+   if(size < 0 || (uint)i >= curproc->sz || (uint)i+size > curproc->sz)
+@@ -103,6 +103,10 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++// add function
++extern int sys_getsyscallinfo(void);
++extern int sys_settickets(void);
++extern int sys_getpinfo(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +130,9 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getsyscallinfo]   sys_getsyscallinfo,
++[SYS_settickets] sys_settickets,
++[SYS_getpinfo] sys_getpinfo,
+ };
+ 
+ void
+@@ -136,6 +143,8 @@ syscall(void)
+ 
+   num = curproc->tf->eax;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++    // increment sysCounter
++    syscallCount++;
+     curproc->tf->eax = syscalls[num]();
+   } else {
+     cprintf("%d %s: unknown sys call %d\n",
+diff --git a/syscall.h b/syscall.h
+index bc5f356..cc6a373 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getsyscallinfo 22   // add system call number
++#define SYS_settickets  23
++#define SYS_getpinfo 24
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..9059a09 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,33 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// return the number of calls made since the system booted on success,
++// and -1 on failure
++int
++sys_getsyscallinfo(void)
++{
++  // myproc return proc
++  return syscallCount;
++}
++
++int
++sys_settickets(void)
++{
++  int num_tikets;
++  // if it can receive
++  if (argint(0, &num_tikets) < 0)
++    return -1;
++  //cprintf("argint: %d\n" ,num_tikets);
++  return settickets(num_tikets);
++}
++
++int
++sys_getpinfo(void)
++{
++  struct pstat* pinfo;
++  //if(argfd(0, 0, &f) < 0 || argptr(1, (void*)&st, sizeof(*st)) < 0)
++  if (argptr(0,(void*)&pinfo,sizeof(*pinfo)) < 0)
++    return -1;
++  return getpinfo(pinfo);
++}
+\ No newline at end of file
+diff --git a/trap.c b/trap.c
+index 41c66eb..7b57725 100644
+--- a/trap.c
++++ b/trap.c
+@@ -14,6 +14,8 @@ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
+ struct spinlock tickslock;
+ uint ticks;
+ 
++uint is_boost = 0;
++
+ void
+ tvinit(void)
+ {
+@@ -47,12 +49,20 @@ trap(struct trapframe *tf)
+   }
+ 
+   switch(tf->trapno){
++    // Every tick, the hardware clock forces an interrupt, which is handled in trap() by case T_IRQ0 + IRQ_TIMER
++    // https://pdos.csail.mit.edu/6.828/2014/homework/xv6-alarm.html
+   case T_IRQ0 + IRQ_TIMER:
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
++
++      // set 1 each 100 ticks
++      if(ticks%100 == 0){
++        is_boost=1;
++      }
+       wakeup(&ticks);
+       release(&tickslock);
++      //cprintf("ticks: %d\n", ticks);
+     }
+     lapiceoi();
+     break;
+diff --git a/user.h b/user.h
+index 4f99c52..aa4bb59 100644
+--- a/user.h
++++ b/user.h
+@@ -1,5 +1,6 @@
+ struct stat;
+ struct rtcdate;
++struct pstat;
+ 
+ // system calls
+ int fork(void);
+@@ -23,7 +24,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+-
++int getsyscallinfo(void);
++int settickets(int);
++int getpinfo(struct pstat*);
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..f5a0894 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,6 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(getsyscallinfo)
++SYSCALL(settickets)
++SYSCALL(getpinfo)
+\ No newline at end of file
