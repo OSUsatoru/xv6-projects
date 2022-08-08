@@ -10,3 +10,6 @@ When there is more than one job on a queue, each should run in proportion to the
 You'll need a couple of new system calls to implement this scheduler. The first is int settickets(int num) , which sets the number of tickets of the calling process. By default, each process should get one ticket; calling this routine makes it such that a process can raise the number of tickets it receives, and thus receive a higher proportion of CPU cycles. This routine should return 0 if successful, and -1 otherwise (if, for example, the user passes in a number less than one).
 
 The second is int getpinfo(struct pstat *) . This routine returns some basic information about each running process, including how many times it has been chosen to run and its process ID, and which queue it is on (high or low). You can use this system call to build a variant of the command line program ps , which can then be called to see what is going on.
+
+## Report
+### [Scheduling in xv6](https://github.com/OSUsatoru/xv6-projects/blob/main/Scheduling_xv6/Scheduling.pdf)
